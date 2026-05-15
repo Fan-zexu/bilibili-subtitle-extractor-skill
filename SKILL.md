@@ -10,7 +10,7 @@ description: >-
 
 # B站视频字幕提取
 
-从B站视频中提取字幕，生成带时间戳的Markdown文字稿和纯文本TXT文件。纯标准库实现，无需安装第三方依赖。
+从B站视频中提取字幕，生成带时间戳的Markdown文字稿和纯文本TXT文件。纯标准库实现为主，可选 yt-dlp 作为降级方案。
 
 ## 支持的输入类型
 
@@ -25,11 +25,25 @@ description: >-
 
 ## 工作原理
 
-脚本通过三条路径依次尝试获取字幕，任一成功即停止：
+脚本通过四条路径依次尝试获取字幕，自动降级：
 
 1. **路径0 — view 接口**：调用 `/x/web-interface/view` 获取视频信息时，有时响应中直接包含字幕列表
 2. **路径1 — dm/view 接口**：调用 `/x/v2/dm/view`（弹幕视图接口），不需要 WBI 签名和 Cookie，能获取大部分视频的 AI 字幕
 3. **路径2 — player/wbi/v2 接口**：需要 WBI 签名，Cookie 可选但有助于获取更多 AI 字幕。当路径0和路径1都失败时使用
+4. **路径3 — yt-dlp 降级**（需安装 yt-dlp）：当路径0/1/2都失败、或返回的字幕数据不完整时自动触发。通过 yt-dlp + 浏览器Cookie 获取字幕，特别适合以下场景：
+   - 需要登录才能获取AI字幕的视频
+   - 多分P视频（API仅返回部分分P的字幕）
+   - API返回的字幕段数异常少（字幕密度低于阈值）
+
+### yt-dlp 降级触发条件
+
+满足以下任一条件时自动触发路径3：
+
+- API 完全没有返回字幕
+- 多分P视频（分P数 > 1）但 API 返回的字幕段数 < 每P 5段
+- 字幕密度低于 1段/分钟（视频时长 > 1分钟时检查）
+
+路径3获取到字幕后，会与 API 结果比较，自动选择更完整的数据。
 
 字幕语言按优先级自动选择：`zh-Hans > zh > zh-CN > ai-zh > en > ja > ko`
 
@@ -38,13 +52,14 @@ description: >-
 运行脚本，传入B站视频URL、BV号或合集URL：
 
 ```bash
-python3 <skill-dir>/scripts/extract_subtitle.py <URL或BV号> [--output-dir <输出目录>] [--cookie <Cookie字符串>]
+python3 <skill-dir>/scripts/extract_subtitle.py <URL或BV号> [--output-dir <输出目录>] [--cookie <Cookie字符串>] [--browser <浏览器>]
 ```
 
 参数说明：
 - 第一个参数：B站视频URL、纯BV号，或合集/系列URL
 - `--output-dir`：输出文件保存目录，默认为当前工作目录
-- `--cookie`：可选，B站登录Cookie（SESSDATA等），有助于获取更多AI字幕
+- `--cookie`：可选，B站登录Cookie（SESSDATA等），有助于路径0/1/2获取更多AI字幕
+- `--browser`：可选，yt-dlp 降级时提取Cookie的浏览器（默认 `chrome`，可选：`firefox`、`edge`、`safari`等）
 
 ### 示例
 
@@ -58,6 +73,11 @@ python3 <skill-dir>/scripts/extract_subtitle.py "https://www.bilibili.com/video/
 python3 <skill-dir>/scripts/extract_subtitle.py "https://space.bilibili.com/476706561/lists/2795389?type=series" --output-dir ./output
 ```
 
+使用 Firefox 浏览器Cookie（当Chrome不可用时）：
+```bash
+python3 <skill-dir>/scripts/extract_subtitle.py "BV1sD4y1v7oC" --output-dir ./output --browser firefox
+```
+
 ## 输出文件
 
 ### 单视频模式
@@ -66,6 +86,7 @@ python3 <skill-dir>/scripts/extract_subtitle.py "https://space.bilibili.com/4767
 
 1. **`<视频标题>_字幕.md`** — Markdown格式，包含：
    - 视频元信息（BV号、时长、UP主、字幕语言和类型）
+   - 获取来源（view / dm/view / player/wbi/v2 / yt-dlp）
    - 带时间戳的文字稿（`[HH:MM:SS] 文本`格式）
    - 按标点合并的纯文字稿段落
 
@@ -86,11 +107,17 @@ python3 <skill-dir>/scripts/extract_subtitle.py "https://space.bilibili.com/4767
 5. 单视频：告诉用户文件路径，并展示文字稿前几百字作为预览
 6. 合集：告诉用户目录索引路径和提取统计（成功/失败/无字幕数量）
 
+## 依赖说明
+
+- **核心功能**（路径0/1/2）：纯Python标准库（urllib、json、hashlib等），不需要 pip install 任何包
+- **降级方案**（路径3）：需要安装 `yt-dlp`（`pip3 install yt-dlp`），且本地浏览器已登录B站。yt-dlp 未安装时自动跳过路径3
+
 ## 注意事项
 
 - 不是所有B站视频都有字幕，部分视频可能没有AI字幕也没有CC字幕
-- 如果三条路径都未获取到字幕，告知用户该视频暂无可用字幕
-- 脚本使用纯Python标准库（urllib、json、hashlib等），不需要 pip install 任何包
-- 如果用户提供了Cookie，通过 `--cookie` 参数传入，可以提高AI字幕的获取成功率
+- 如果四条路径都未获取到字幕，告知用户该视频暂无可用字幕
+- 如果用户提供了Cookie，通过 `--cookie` 参数传入，可以提高路径0/1/2的AI字幕获取成功率
+- yt-dlp 降级方案需要本地浏览器（默认Chrome）已登录B站，通过 `--browser` 参数可切换浏览器
 - 合集批量提取时，每个视频之间会间隔1秒，避免触发B站频率限制
 - 合集视频较多时（如几十上百个），提取过程可能需要较长时间，请耐心等待
+- 多分P视频（如一个BV号包含几十上百个分P）是路径3的典型适用场景

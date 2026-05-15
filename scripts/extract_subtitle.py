@@ -8,19 +8,24 @@ B站视频字幕提取工具（纯标准库，无需第三方依赖）
   3. 合集/系列URL: https://space.bilibili.com/{mid}/lists/{series_id}?type=series
   4. 收藏夹合集URL: https://space.bilibili.com/{mid}/channel/collectiondetail?sid={season_id}
 
-三条字幕获取路径自动降级：
+四条字幕获取路径自动降级：
   路径0: view 接口直接返回字幕
   路径1: /x/v2/dm/view (弹幕视图接口，不需要 WBI 签名)
   路径2: /x/player/wbi/v2 (播放器接口，需要 WBI 签名，Cookie 可选)
+  路径3: yt-dlp 降级 (通过浏览器Cookie获取AI字幕，支持多分P视频)
 """
 
 import argparse
+import glob as glob_mod
 import hashlib
 import json
 import os
 import re
+import shutil
 import ssl
+import subprocess
 import sys
+import tempfile
 import time
 import urllib.parse
 import urllib.request
@@ -47,6 +52,10 @@ DEFAULT_UA = (
 SSL_CTX = ssl.create_default_context()
 SSL_CTX.check_hostname = False
 SSL_CTX.verify_mode = ssl.CERT_NONE
+
+# yt-dlp 降级触发阈值：每分钟视频至少应有这么多段字幕
+# 如果低于此值，认为API返回的数据不完整
+YTDLP_MIN_SEGMENTS_PER_MIN = 1.0
 
 
 # ========== HTTP ==========
@@ -217,7 +226,7 @@ def normalize_url(url: str) -> str:
     return url
 
 
-# ========== 三条获取路径 ==========
+# ========== 三条API获取路径 ==========
 
 def path0_from_view(view_data: dict) -> Optional[dict]:
     """路径0: view 接口直接带字幕（且字幕URL不为空）"""
@@ -267,6 +276,273 @@ def path2_player_wbi(bvid: str, cid: int, cookie: str = "") -> Optional[dict]:
         return None
 
 
+# ========== 路径3: yt-dlp 降级 ==========
+
+def _check_ytdlp() -> bool:
+    """检查 yt-dlp 是否可用"""
+    return shutil.which("yt-dlp") is not None
+
+
+def _parse_srt_time(time_str: str) -> float:
+    """解析 SRT 时间格式 HH:MM:SS,mmm -> 秒数"""
+    time_str = time_str.strip()
+    parts = time_str.replace(",", ".").split(":")
+    if len(parts) == 3:
+        h, m, s = float(parts[0]), float(parts[1]), float(parts[2])
+        return h * 3600 + m * 60 + s
+    return 0.0
+
+
+def _parse_srt(srt_content: str) -> list:
+    """
+    解析 SRT 内容为 segments 列表。
+    返回 [{"from": float, "to": float, "content": str}, ...]
+    """
+    segments = []
+    blocks = re.split(r"\n\s*\n", srt_content.strip())
+    for block in blocks:
+        lines = block.strip().split("\n")
+        if len(lines) < 2:
+            continue
+        # 找到时间行（包含 -->）
+        time_line = None
+        text_lines = []
+        found_time = False
+        for line in lines:
+            if "-->" in line and not found_time:
+                time_line = line
+                found_time = True
+            elif found_time:
+                text_lines.append(line.strip())
+        if not time_line:
+            continue
+        # 解析时间
+        time_match = re.match(
+            r"(\d{2}:\d{2}:\d{2}[,\.]\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2}[,\.]\d{3})",
+            time_line.strip()
+        )
+        if not time_match:
+            continue
+        start = _parse_srt_time(time_match.group(1))
+        end = _parse_srt_time(time_match.group(2))
+        text = " ".join(text_lines).strip()
+        if text:
+            segments.append({"from": start, "to": end, "content": text})
+    return segments
+
+
+def _extract_part_number(filename: str) -> int:
+    """从 yt-dlp 生成的文件名中提取分P编号"""
+    # yt-dlp 多P视频文件名通常包含 .Pxx. 或 _Pxx_ 之类的模式
+    # 例如: video_title.P01.ai-zh.srt, video_title.P02.ai-zh.srt
+    m = re.search(r"[._]P(\d+)[._]", filename)
+    if m:
+        return int(m.group(1))
+    # 也尝试匹配 part 或分P数字
+    m2 = re.search(r"[._](\d+)[._]", os.path.basename(filename))
+    if m2:
+        return int(m2.group(1))
+    return 0
+
+
+def path3_ytdlp(bvid: str, browser: str = "chrome", pages: list = None,
+                 duration: int = 0) -> Optional[dict]:
+    """
+    路径3: 使用 yt-dlp + 浏览器Cookie 获取字幕（降级方案）
+
+    适用于：
+    - API路径0/1/2都获取不到字幕
+    - 多分P视频API只返回部分数据
+    - 需要登录才能获取AI字幕的视频
+
+    参数:
+        bvid: BV号
+        browser: Cookie来源浏览器，默认 chrome
+        pages: 视频分P信息列表 [{cid, part, duration}, ...]
+        duration: 视频总时长（秒）
+
+    返回:
+        成功: {"segments": [...], "source": "yt-dlp", "language": str, "subtitle_type": str}
+        失败: None
+    """
+    if not _check_ytdlp():
+        print("  [路径3] yt-dlp 未安装，跳过降级方案")
+        print("  [路径3] 可通过 pip3 install yt-dlp 安装")
+        return None
+
+    print(f"  [路径3] 使用 yt-dlp 降级方案 (浏览器Cookie: {browser})...")
+    video_url = f"https://www.bilibili.com/video/{bvid}"
+
+    # 创建临时目录存放 SRT 文件
+    tmp_dir = tempfile.mkdtemp(prefix="bili_ytdlp_")
+    try:
+        # 构建 yt-dlp 命令
+        cmd = [
+            "yt-dlp",
+            "--cookies-from-browser", browser,
+            "--write-subs",
+            "--write-auto-subs",
+            "--sub-langs", "ai-zh,zh-Hans,zh,zh-CN,en",
+            "--sub-format", "srt",
+            "--skip-download",
+            "--no-warnings",
+            "-o", os.path.join(tmp_dir, "%(title)s.%(autonumber)s.%(ext)s"),
+            video_url,
+        ]
+
+        print(f"  [路径3] 执行: yt-dlp --cookies-from-browser {browser} ...")
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=300,  # 5分钟超时
+        )
+
+        if proc.returncode != 0:
+            stderr = proc.stderr.strip()
+            # 检查是否是cookie相关错误
+            if "cookies" in stderr.lower():
+                print(f"  [路径3] 浏览器Cookie提取失败: {stderr[:200]}")
+                print(f"  [路径3] 请确保 {browser} 浏览器已登录B站")
+            else:
+                print(f"  [路径3] yt-dlp 执行失败: {stderr[:200]}")
+            return None
+
+        # 查找所有 SRT 文件
+        srt_files = sorted(glob_mod.glob(os.path.join(tmp_dir, "*.srt")))
+        if not srt_files:
+            print("  [路径3] yt-dlp 未生成任何字幕文件")
+            # 检查是否只有弹幕（danmaku）
+            all_files = os.listdir(tmp_dir)
+            if all_files:
+                print(f"  [路径3] 目录中的文件: {all_files[:5]}")
+            return None
+
+        print(f"  [路径3] 找到 {len(srt_files)} 个 SRT 字幕文件")
+
+        # 检测字幕语言
+        detected_lang = "ai-zh"
+        subtitle_type = "ai"
+        for f in srt_files:
+            basename = os.path.basename(f)
+            if "ai-zh" in basename:
+                detected_lang = "中文（AI生成）"
+                subtitle_type = "ai"
+                break
+            elif "zh-Hans" in basename or "zh-CN" in basename:
+                detected_lang = "中文（简体）"
+                subtitle_type = "manual"
+                break
+            elif ".zh." in basename:
+                detected_lang = "中文"
+                subtitle_type = "auto"
+                break
+            elif ".en." in basename:
+                detected_lang = "English"
+                subtitle_type = "auto"
+                break
+
+        # 解析并合并所有 SRT 文件
+        all_segments = []
+
+        if len(srt_files) == 1:
+            # 单个文件，直接解析
+            with open(srt_files[0], "r", encoding="utf-8") as f:
+                content = f.read()
+            all_segments = _parse_srt(content)
+        else:
+            # 多个文件（多分P），按分P顺序合并，累加时间偏移
+            # 按文件名中的编号排序
+            file_parts = []
+            for srt_file in srt_files:
+                part_num = _extract_part_number(srt_file)
+                file_parts.append((part_num, srt_file))
+            file_parts.sort(key=lambda x: x[0])
+
+            time_offset = 0.0
+            for i, (part_num, srt_file) in enumerate(file_parts):
+                with open(srt_file, "r", encoding="utf-8") as f:
+                    content = f.read()
+                part_segments = _parse_srt(content)
+                if not part_segments:
+                    continue
+
+                # 给每段加上时间偏移
+                for seg in part_segments:
+                    seg["from"] += time_offset
+                    seg["to"] += time_offset
+                    all_segments.append(seg)
+
+                # 计算下一个分P的时间偏移
+                # 使用当前分P最后一段字幕的结束时间
+                max_end = max(seg["to"] for seg in part_segments)
+                time_offset += max_end
+
+                print(f"    分P{i+1}: {len(part_segments)} 段字幕，"
+                      f"时长 {max_end:.1f}s")
+
+        if not all_segments:
+            print("  [路径3] SRT 文件解析后无有效字幕段")
+            return None
+
+        total_chars = sum(len(seg["content"]) for seg in all_segments)
+        print(f"  [路径3] 成功: 共 {len(all_segments)} 段, {total_chars} 字")
+
+        return {
+            "segments": all_segments,
+            "source": "yt-dlp",
+            "language": detected_lang,
+            "subtitle_type": subtitle_type,
+        }
+
+    except subprocess.TimeoutExpired:
+        print("  [路径3] yt-dlp 执行超时（5分钟限制）")
+        return None
+    except Exception as e:
+        print(f"  [路径3] 异常: {e}")
+        return None
+    finally:
+        # 清理临时目录
+        try:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+
+def _should_try_ytdlp(segments: list, duration: int, pages: list) -> bool:
+    """
+    判断是否需要触发 yt-dlp 降级。
+
+    触发条件（满足任一即触发）：
+    1. API完全没返回字幕（segments为空）
+    2. 多分P视频（pages > 1）但API只返回了很少的字幕段
+    3. 字幕段数相对视频时长异常少（低于阈值）
+    """
+    # 条件1: 完全没字幕
+    if not segments:
+        return True
+
+    # 条件2: 多分P视频，字幕段数异常少
+    num_pages = len(pages) if pages else 1
+    if num_pages > 1:
+        expected_min = num_pages * 5  # 每P至少5段
+        if len(segments) < expected_min:
+            print(f"  [降级判断] 多分P视频({num_pages}P)但仅{len(segments)}段字幕"
+                  f"（期望至少{expected_min}段），触发yt-dlp降级")
+            return True
+
+    # 条件3: 字幕密度过低
+    if duration > 60:  # 仅对超过1分钟的视频检查
+        duration_min = duration / 60.0
+        density = len(segments) / duration_min
+        if density < YTDLP_MIN_SEGMENTS_PER_MIN:
+            print(f"  [降级判断] 字幕密度过低({density:.2f}段/分钟"
+                  f"< {YTDLP_MIN_SEGMENTS_PER_MIN})，触发yt-dlp降级")
+            return True
+
+    return False
+
+
 # ========== 文字稿转换 ==========
 
 def to_timestamped(segments: list) -> str:
@@ -297,7 +573,7 @@ def to_plain_text(segments: list) -> str:
 
 # ========== 单视频提取 ==========
 
-def extract(url: str, cookie: str = "") -> dict:
+def extract(url: str, cookie: str = "", browser: str = "chrome") -> dict:
     """提取单个视频字幕，返回结构化结果"""
     bvid = parse_bvid(url)
     if not bvid:
@@ -333,8 +609,10 @@ def extract(url: str, cookie: str = "") -> dict:
     print(f"  标题: {title}")
     print(f"  UP主: {owner}")
     print(f"  时长: {duration // 60}分{duration % 60}秒")
+    if len(pages) > 1:
+        print(f"  分P数: {len(pages)}")
 
-    # 三条路径依次尝试
+    # === API路径 0/1/2 ===
     result = path0_from_view(vdata)
 
     if not result:
@@ -349,7 +627,49 @@ def extract(url: str, cookie: str = "") -> dict:
             if result:
                 break
 
-    if not result:
+    # 如果API路径成功，先获取字幕内容
+    api_segments = []
+    api_meta = {}
+    if result:
+        best = pick_best_subtitle(result["subtitles"])
+        lang = best.get("lan_doc", best.get("lan", "未知"))
+        lan_code = best.get("lan", "")
+        sub_type = ("ai" if best.get("ai_type") or lan_code.startswith("ai-")
+                    else "auto" if "自动" in lang else "manual")
+        sub_url = normalize_url(best.get("subtitle_url", ""))
+        print(f"  字幕: {lang} ({sub_type}, {result['source']})")
+
+        api_segments = fetch_json(sub_url, cookie).get("body", [])
+        print(f"  共 {len(api_segments)} 段")
+        api_meta = {
+            "language": lang, "subtitle_type": sub_type,
+            "source": result["source"],
+        }
+
+    # === 路径3: yt-dlp 降级判断 ===
+    # 检查API结果是否足够完整，不够则尝试 yt-dlp
+    segments = api_segments
+    meta = api_meta
+
+    if _should_try_ytdlp(api_segments, duration, pages):
+        ytdlp_result = path3_ytdlp(bvid, browser, pages, duration)
+        if ytdlp_result:
+            ytdlp_segments = ytdlp_result["segments"]
+            # 如果 yt-dlp 获取的字幕比API多，使用 yt-dlp 的结果
+            if len(ytdlp_segments) > len(api_segments):
+                print(f"  [降级] yt-dlp 获取了 {len(ytdlp_segments)} 段"
+                      f"（API仅 {len(api_segments)} 段），使用 yt-dlp 结果")
+                segments = ytdlp_segments
+                meta = {
+                    "language": ytdlp_result["language"],
+                    "subtitle_type": ytdlp_result["subtitle_type"],
+                    "source": ytdlp_result["source"],
+                }
+            else:
+                print(f"  [降级] yt-dlp ({len(ytdlp_segments)}段)"
+                      f" 未比API ({len(api_segments)}段) 多，保留API结果")
+
+    if not segments:
         return {
             "has_subtitle": False, "title": title, "bvid": bvid,
             "duration": duration, "owner": owner, "language": "",
@@ -357,23 +677,12 @@ def extract(url: str, cookie: str = "") -> dict:
             "timestamped_text": "", "full_text": "",
         }
 
-    # 选最佳字幕
-    best = pick_best_subtitle(result["subtitles"])
-    lang = best.get("lan_doc", best.get("lan", "未知"))
-    lan_code = best.get("lan", "")
-    sub_type = ("ai" if best.get("ai_type") or lan_code.startswith("ai-")
-                else "auto" if "自动" in lang else "manual")
-
-    sub_url = normalize_url(best.get("subtitle_url", ""))
-    print(f"  字幕: {lang} ({sub_type}, {result['source']})")
-
-    segments = fetch_json(sub_url, cookie).get("body", [])
-    print(f"  共 {len(segments)} 段")
-
     return {
         "has_subtitle": True, "title": title, "bvid": bvid,
-        "duration": duration, "owner": owner, "language": lang,
-        "subtitle_type": sub_type, "source": result["source"],
+        "duration": duration, "owner": owner,
+        "language": meta.get("language", ""),
+        "subtitle_type": meta.get("subtitle_type", ""),
+        "source": meta.get("source", ""),
         "segments": segments,
         "timestamped_text": to_timestamped(segments),
         "full_text": to_plain_text(segments),
@@ -413,7 +722,8 @@ def save(result: dict, output_dir: str) -> tuple:
 
 # ========== 合集批量提取 ==========
 
-def extract_batch(videos: list, output_dir: str, cookie: str = "") -> dict:
+def extract_batch(videos: list, output_dir: str, cookie: str = "",
+                  browser: str = "chrome") -> dict:
     """
     批量提取合集中所有视频的字幕。
     返回 {"success": [...], "failed": [...], "no_subtitle": [...], "index_path": str}
@@ -431,7 +741,7 @@ def extract_batch(videos: list, output_dir: str, cookie: str = "") -> dict:
         print(f"  BV号: {bvid} | 时长: {dur // 60}分{dur % 60}秒")
 
         try:
-            result = extract(bvid, cookie)
+            result = extract(bvid, cookie, browser)
             if result["has_subtitle"]:
                 md_path, txt_path = save(result, output_dir)
                 success.append({
@@ -492,6 +802,10 @@ def main():
     parser.add_argument("url", help="B站视频URL、BV号、合集URL或系列URL")
     parser.add_argument("--output-dir", default=".", help="输出目录（默认当前目录）")
     parser.add_argument("--cookie", default="", help="B站Cookie（可选）")
+    parser.add_argument(
+        "--browser", default="chrome",
+        help="yt-dlp降级时提取Cookie的浏览器（默认chrome，可选: firefox, edge, safari等）"
+    )
     args = parser.parse_args()
 
     print("=" * 60)
@@ -512,7 +826,7 @@ def main():
             d = v["duration"]
             print(f"  [{i+1}] {v['bvid']} | {d//60}:{d%60:02d} | {v['title']}")
         print()
-        batch_result = extract_batch(videos, args.output_dir, args.cookie)
+        batch_result = extract_batch(videos, args.output_dir, args.cookie, args.browser)
         _print_batch_summary(batch_result)
         return
 
@@ -526,7 +840,7 @@ def main():
             d = v["duration"]
             print(f"  [{i+1}] {v['bvid']} | {d//60}:{d%60:02d} | {v['title']}")
         print()
-        batch_result = extract_batch(videos, args.output_dir, args.cookie)
+        batch_result = extract_batch(videos, args.output_dir, args.cookie, args.browser)
         _print_batch_summary(batch_result)
         return
 
@@ -535,7 +849,7 @@ def main():
         print(f"无法识别的输入: {args.url}")
         sys.exit(1)
 
-    result = extract(args.url, args.cookie)
+    result = extract(args.url, args.cookie, args.browser)
 
     if not result["has_subtitle"]:
         print("\n该视频没有可用的字幕。")
