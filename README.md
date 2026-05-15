@@ -1,6 +1,6 @@
 # bilibili-subtitle-extractor-skill
 
-B站(bilibili)视频字幕提取 CatPaw Skill。
+B站(bilibili)视频字幕提取工具。
 
 从B站视频中自动提取 AI 字幕和 CC 字幕，输出带时间戳的 Markdown 文字稿和纯文本 TXT 文件。
 
@@ -8,7 +8,7 @@ B站(bilibili)视频字幕提取 CatPaw Skill。
 
 - **单视频提取**：支持视频URL和纯BV号
 - **合集/系列批量提取**：自动获取视频列表并逐个提取，生成目录索引
-- **三条获取路径自动降级**：view → dm/view → player/wbi/v2
+- **四条获取路径自动降级**：view → dm/view → player/wbi/v2 → yt-dlp
 - **纯标准库实现**：无需 pip install 任何第三方依赖
 - **智能语言选择**：按优先级自动选择最佳字幕语言
 
@@ -23,11 +23,7 @@ B站(bilibili)视频字幕提取 CatPaw Skill。
 
 ## 使用方式
 
-### 作为 CatPaw Skill
-
-将本仓库放入 `~/.catpaw/skills/bili-subtitle/` 或项目的 `.catpaw/skills/bili-subtitle/` 目录下，CatPaw 会自动加载。
-
-### 命令行直接使用
+### 命令行使用
 
 ```bash
 # 单视频
