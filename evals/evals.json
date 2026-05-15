@@ -1,0 +1,69 @@
+{
+  "skill_name": "bili-subtitle",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "帮我把这个B站视频的字幕提取出来 https://www.bilibili.com/video/BV1Qe4y1E77h",
+      "expected_output": "生成包含完整字幕的 Markdown 和 TXT 文件，视频为52分钟的塔罗教程，应有上千条字幕段",
+      "files": [],
+      "assertions": [
+        {
+          "name": "md_file_exists",
+          "type": "file_exists",
+          "description": "应生成 Markdown 字幕文件"
+        },
+        {
+          "name": "txt_file_exists",
+          "type": "file_exists",
+          "description": "应生成 TXT 纯文本字幕文件"
+        },
+        {
+          "name": "has_timestamps",
+          "type": "content_check",
+          "description": "Markdown 文件应包含带时间戳的文字稿（[HH:MM:SS] 格式）"
+        },
+        {
+          "name": "sufficient_content",
+          "type": "content_check",
+          "description": "纯文本字幕应超过 5000 字（52分钟视频）"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "BV1GJ411x7h7 这个视频有没有字幕？帮我提取文字稿保存到 /Users/zhangnan53/workspace/bili-subtitle-workspace/iteration-1/eval-short-video/outputs 下",
+      "expected_output": "用纯BV号（无完整URL）也能正常工作，生成字幕文件或提示无字幕",
+      "files": [],
+      "assertions": [
+        {
+          "name": "bvid_parsed",
+          "type": "behavior_check",
+          "description": "能正确从纯BV号中解析并开始提取流程"
+        },
+        {
+          "name": "output_or_notice",
+          "type": "behavior_check",
+          "description": "要么生成字幕文件，要么明确告知用户该视频无可用字幕"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "我想把 https://www.bilibili.com/video/BV1uT4y1P7CX 这个视频转成文字，方便我之后做笔记",
+      "expected_output": "提取字幕并生成双格式输出，用户没有说'字幕'但意图明确，skill应被触发",
+      "files": [],
+      "assertions": [
+        {
+          "name": "skill_triggered",
+          "type": "behavior_check",
+          "description": "用户说'视频转文字'时 skill 应被触发"
+        },
+        {
+          "name": "dual_output",
+          "type": "file_exists",
+          "description": "应同时生成 .md 和 .txt 两个文件"
+        }
+      ]
+    }
+  ]
+}
