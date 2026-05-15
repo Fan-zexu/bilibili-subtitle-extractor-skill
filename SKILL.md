@@ -25,7 +25,7 @@ description: >-
 
 ## 工作原理
 
-脚本通过四条路径依次尝试获取字幕，自动降级：
+脚本通过五条路径依次尝试获取字幕，自动降级：
 
 1. **路径0 — view 接口**：调用 `/x/web-interface/view` 获取视频信息时，有时响应中直接包含字幕列表
 2. **路径1 — dm/view 接口**：调用 `/x/v2/dm/view`（弹幕视图接口），不需要 WBI 签名和 Cookie，能获取大部分视频的 AI 字幕
@@ -34,6 +34,7 @@ description: >-
    - 需要登录才能获取AI字幕的视频
    - 多分P视频（API仅返回部分分P的字幕）
    - API返回的字幕段数异常少（字幕密度低于阈值）
+5. **路径4 — Whisper 语音识别**（需安装 openai-whisper + yt-dlp）：当路径0/1/2/3 均无法获取字幕时的最终兜底方案。先用 yt-dlp 下载音频，再用本地 Whisper 模型（默认 small）进行语音识别，适合完全没有字幕的视频。耗时较长，请耐心等待
 
 ### yt-dlp 降级触发条件
 
@@ -44,6 +45,10 @@ description: >-
 - 字幕密度低于 1段/分钟（视频时长 > 1分钟时检查）
 
 路径3获取到字幕后，会与 API 结果比较，自动选择更完整的数据。
+
+### Whisper 语音识别触发条件
+
+路径0/1/2/3 全部失败（segments 为空）时自动触发路径4，使用 Whisper small 模型进行本地语音识别。
 
 字幕语言按优先级自动选择：`zh-Hans > zh > zh-CN > ai-zh > en > ja > ko`
 
@@ -59,7 +64,7 @@ python3 <skill-dir>/scripts/extract_subtitle.py <URL或BV号> [--output-dir <输
 - 第一个参数：B站视频URL、纯BV号，或合集/系列URL
 - `--output-dir`：输出文件保存目录，默认为当前工作目录
 - `--cookie`：可选，B站登录Cookie（SESSDATA等），有助于路径0/1/2获取更多AI字幕
-- `--browser`：可选，yt-dlp 降级时提取Cookie的浏览器（默认 `chrome`，可选：`firefox`、`edge`、`safari`等）
+- `--browser`：可选，yt-dlp 降级（路径3/4）时提取Cookie的浏览器（默认 `chrome`，可选：`firefox`、`edge`、`safari`等）
 
 ### 示例
 
@@ -86,7 +91,7 @@ python3 <skill-dir>/scripts/extract_subtitle.py "BV1sD4y1v7oC" --output-dir ./ou
 
 1. **`<视频标题>_字幕.md`** — Markdown格式，包含：
    - 视频元信息（BV号、时长、UP主、字幕语言和类型）
-   - 获取来源（view / dm/view / player/wbi/v2 / yt-dlp）
+   - 获取来源（view / dm/view / player/wbi/v2 / yt-dlp / whisper）
    - 带时间戳的文字稿（`[HH:MM:SS] 文本`格式）
    - 按标点合并的纯文字稿段落
 
@@ -111,11 +116,13 @@ python3 <skill-dir>/scripts/extract_subtitle.py "BV1sD4y1v7oC" --output-dir ./ou
 
 - **核心功能**（路径0/1/2）：纯Python标准库（urllib、json、hashlib等），不需要 pip install 任何包
 - **降级方案**（路径3）：需要安装 `yt-dlp`（`pip3 install yt-dlp`），且本地浏览器已登录B站。yt-dlp 未安装时自动跳过路径3
+- **语音识别兜底**（路径4）：需要安装 `openai-whisper`（`pip3 install openai-whisper`）和 `yt-dlp`。首次运行会自动下载 Whisper small 模型（约461MB）。未安装时自动跳过路径4
 
 ## 注意事项
 
 - 不是所有B站视频都有字幕，部分视频可能没有AI字幕也没有CC字幕
-- 如果四条路径都未获取到字幕，告知用户该视频暂无可用字幕
+- 如果五条路径都未获取到字幕（包括 Whisper 未安装或转录失败），告知用户该视频暂无可用字幕
+- 路径4（Whisper）耗时较长：small 模型在 CPU 上处理1小时视频约需10-30分钟，请提前告知用户
 - 如果用户提供了Cookie，通过 `--cookie` 参数传入，可以提高路径0/1/2的AI字幕获取成功率
 - yt-dlp 降级方案需要本地浏览器（默认Chrome）已登录B站，通过 `--browser` 参数可切换浏览器
 - 合集批量提取时，每个视频之间会间隔1秒，避免触发B站频率限制

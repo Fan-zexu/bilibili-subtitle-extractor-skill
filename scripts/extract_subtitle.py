@@ -8,11 +8,12 @@ B站视频字幕提取工具（纯标准库，无需第三方依赖）
   3. 合集/系列URL: https://space.bilibili.com/{mid}/lists/{series_id}?type=series
   4. 收藏夹合集URL: https://space.bilibili.com/{mid}/channel/collectiondetail?sid={season_id}
 
-四条字幕获取路径自动降级：
+五条字幕获取路径自动降级：
   路径0: view 接口直接返回字幕
   路径1: /x/v2/dm/view (弹幕视图接口，不需要 WBI 签名)
   路径2: /x/player/wbi/v2 (播放器接口，需要 WBI 签名，Cookie 可选)
   路径3: yt-dlp 降级 (通过浏览器Cookie获取AI字幕，支持多分P视频)
+  路径4: Whisper 语音识别 (路径0-3均无字幕时，下载音频用本地Whisper转录)
 """
 
 import argparse
@@ -509,6 +510,170 @@ def path3_ytdlp(bvid: str, browser: str = "chrome", pages: list = None,
             pass
 
 
+# ========== 路径4: Whisper 语音识别 ==========
+
+def _check_whisper() -> Optional[str]:
+    """
+    检查 whisper 是否可用，返回可用的 python 路径或 None。
+    优先使用系统 python3，其次尝试常见路径。
+    """
+    candidates = [
+        sys.executable,
+        "python3",
+        "/Library/Developer/CommandLineTools/usr/bin/python3",
+        "/usr/local/bin/python3",
+        "/opt/homebrew/bin/python3",
+    ]
+    for py in candidates:
+        try:
+            result = subprocess.run(
+                [py, "-c", "import whisper; print('ok')"],
+                capture_output=True, text=True, timeout=10
+            )
+            if result.returncode == 0 and "ok" in result.stdout:
+                return py
+        except Exception:
+            continue
+    return None
+
+
+def _check_ytdlp_for_audio() -> bool:
+    """检查 yt-dlp 是否可用（用于下载音频）"""
+    return shutil.which("yt-dlp") is not None
+
+
+def path4_whisper(bvid: str, browser: str = "chrome", duration: int = 0,
+                  whisper_model: str = "small") -> Optional[dict]:
+    """
+    路径4: 使用 yt-dlp 下载音频 + OpenAI Whisper 本地语音识别
+
+    适用于：路径0/1/2/3 均无法获取字幕（视频无AI字幕、无CC字幕）时的最终兜底方案。
+
+    参数:
+        bvid: BV号
+        browser: Cookie来源浏览器，默认 chrome
+        duration: 视频时长（秒），用于日志显示
+        whisper_model: Whisper模型，默认 small（约461MB，中文效果好）
+
+    返回:
+        成功: {"segments": [...], "source": "whisper", "language": str, "subtitle_type": str}
+        失败: None
+    """
+    # 检查依赖
+    if not _check_ytdlp_for_audio():
+        print("  [路径4] yt-dlp 未安装，无法下载音频，跳过 Whisper 方案")
+        print("  [路径4] 可通过 pip3 install yt-dlp 安装")
+        return None
+
+    py_path = _check_whisper()
+    if not py_path:
+        print("  [路径4] whisper 未安装，跳过语音识别方案")
+        print("  [路径4] 可通过 pip3 install openai-whisper 安装")
+        return None
+
+    dur_str = f"{duration // 60}分{duration % 60}秒" if duration else "未知时长"
+    print(f"  [路径4] 启动 Whisper 语音识别方案（视频时长: {dur_str}，模型: {whisper_model}）")
+    print(f"  [路径4] 注意：此方案耗时较长，请耐心等待...")
+
+    video_url = f"https://www.bilibili.com/video/{bvid}"
+    tmp_dir = tempfile.mkdtemp(prefix="bili_whisper_")
+
+    try:
+        audio_path = os.path.join(tmp_dir, "audio.m4a")
+
+        # Step 1: 下载音频（使用 format 30216: 67kbps AAC，体积小）
+        print(f"  [路径4] 正在下载音频...")
+        dl_cmd = [
+            "yt-dlp",
+            "--cookies-from-browser", browser,
+            "-f", "30216",
+            "-o", audio_path,
+            "--no-warnings",
+            video_url,
+        ]
+        dl_proc = subprocess.run(
+            dl_cmd, capture_output=True, text=True, timeout=600
+        )
+        if dl_proc.returncode != 0 or not os.path.exists(audio_path):
+            # 30216 不可用时降级到最小音频格式
+            print(f"  [路径4] format 30216 不可用，尝试最小音频格式...")
+            dl_cmd[4] = "worstaudio"
+            dl_proc = subprocess.run(
+                dl_cmd, capture_output=True, text=True, timeout=600
+            )
+            if dl_proc.returncode != 0 or not os.path.exists(audio_path):
+                print(f"  [路径4] 音频下载失败: {dl_proc.stderr[:200]}")
+                return None
+
+        audio_size = os.path.getsize(audio_path)
+        print(f"  [路径4] 音频下载完成（{audio_size // 1024 // 1024}MB），开始转录...")
+
+        # Step 2: Whisper 转录，输出 JSON 格式
+        whisper_cmd = [
+            py_path, "-m", "whisper",
+            audio_path,
+            "--model", whisper_model,
+            "--language", "zh",
+            "--output_format", "json",
+            "--output_dir", tmp_dir,
+        ]
+        whisper_proc = subprocess.run(
+            whisper_cmd,
+            capture_output=True, text=True,
+            timeout=duration * 3 + 600 if duration else 7200,  # 超时=视频时长*3+10分钟
+        )
+        if whisper_proc.returncode != 0:
+            print(f"  [路径4] Whisper 转录失败: {whisper_proc.stderr[:300]}")
+            return None
+
+        # Step 3: 读取 JSON 结果
+        json_files = glob_mod.glob(os.path.join(tmp_dir, "*.json"))
+        if not json_files:
+            print("  [路径4] Whisper 未生成 JSON 输出文件")
+            return None
+
+        with open(json_files[0], "r", encoding="utf-8") as f:
+            whisper_data = json.load(f)
+
+        raw_segments = whisper_data.get("segments", [])
+        if not raw_segments:
+            print("  [路径4] Whisper 转录结果为空")
+            return None
+
+        # Step 4: 转换为统一的 segments 格式
+        segments = []
+        for seg in raw_segments:
+            text = seg.get("text", "").strip()
+            if text:
+                segments.append({
+                    "from": seg.get("start", 0),
+                    "to": seg.get("end", 0),
+                    "content": text,
+                })
+
+        total_chars = sum(len(s["content"]) for s in segments)
+        print(f"  [路径4] Whisper 转录完成: {len(segments)} 段, {total_chars} 字")
+
+        return {
+            "segments": segments,
+            "source": "whisper",
+            "language": "中文（Whisper语音识别）",
+            "subtitle_type": f"whisper-{whisper_model}",
+        }
+
+    except subprocess.TimeoutExpired:
+        print(f"  [路径4] Whisper 转录超时（视频时长 {dur_str}）")
+        return None
+    except Exception as e:
+        print(f"  [路径4] 异常: {e}")
+        return None
+    finally:
+        try:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+
 def _should_try_ytdlp(segments: list, duration: int, pages: list) -> bool:
     """
     判断是否需要触发 yt-dlp 降级。
@@ -668,6 +833,18 @@ def extract(url: str, cookie: str = "", browser: str = "chrome") -> dict:
             else:
                 print(f"  [降级] yt-dlp ({len(ytdlp_segments)}段)"
                       f" 未比API ({len(api_segments)}段) 多，保留API结果")
+
+    # 路径4: 所有路径均无字幕时，使用 Whisper 语音识别兜底
+    if not segments:
+        print("  [降级] 路径0/1/2/3 均未获取到字幕，尝试路径4: Whisper 语音识别...")
+        whisper_result = path4_whisper(bvid, browser, duration, whisper_model="small")
+        if whisper_result:
+            segments = whisper_result["segments"]
+            meta = {
+                "language": whisper_result["language"],
+                "subtitle_type": whisper_result["subtitle_type"],
+                "source": whisper_result["source"],
+            }
 
     if not segments:
         return {
